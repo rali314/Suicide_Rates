@@ -1,0 +1,335 @@
+---
+title: "Predicting Suicide Rates"
+subtitle: "Capstone Project"
+author: "Rahma Ali"
+date: "01/10/2019"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+    toc: true
+    theme: united
+---
+```{r load-packages, include=FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(ggcorrplot)) install.packages("ggcorrplot", repos = "http://cran.us.r-project.org")
+if(!require(scales)) install.packages("scales", repos = "http://cran.us.r-project.org")
+options(scipen=10000)
+
+```
+
+This project is submitted in partial fulfillment of the requirements for obtaining HarvardX Professional Certificate of Data Science from, offered via EdX.
+
+## 1. Introduction and Project Motivation
+This project aims at creating a machine learning algorithm for suicide rate prediction.  It uses country level suicide rates data from the World Health Organization and other country level indicators from The World Bank (WB) and The United Nations Development Program (UNDP), starting in 1985 to 2016. The data contains information on suicide rates per 100k population with respect to populaion age, sex, generation, country Gross Domestinc Product (GDP), population size, and Human Development Index (HDI) country score. The combined dataet is available online though <https://www.kaggle.com/russellyates88/suicide-rates-overview-1985-to-2016>.
+
+At first, the data is downloaded from the web. I added the combined csv data file (as downloaded from kaggle link above) to my github repository for ease of download and code reproducibility.
+
+```{r data_download}
+# Download data file
+################################
+dl <- tempfile()
+download.file("https://raw.githubusercontent.com/rali314/Suicide_Rates/master/master.csv", 
+        dl)
+suicide <- read.csv(dl, col.names = c("country", "year", "sex", "age", "suicides_no", 
+        "population", "suicide_rate", "country.year", "HDI.for.year", "gdp_for_year", 
+        "gdp_per_capita", "generation"))
+
+```
+
+## 2. Data Exploration
+Now, we take an overall look on the suicide data.
+
+```{r data_explore}
+# Explore the data
+################################
+glimpse(suicide)
+```
+The `suicide` dataset in hand includes 12 varibales: 1 target variable and 11 features. The target variable is `suicide_rate`, which is the suicide rate per 100k population. The features, respictively, are: country name, year, sex, age, population size, HDI score, GDP and GDP per capita and generation.
+
+### The Target Variable: `suicide_rate`
+The distribution of the `suicide_rate` variable seems to be extremely positivly skewed to the right, with a spike at the first bin closest to the value 0. This shape suggests that the majority of the observations have a very small value of suicide rate with a small number of observations with very high values, causing a very long positive tail to the shape of the distribution. This severe skewness might suggest the use of a transformation. This topic will be discussed further later on in the report.
+
+```{r suicide_rate_histogram, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+# Distribution of suicide_rate
+suicide %>% 
+  ggplot(aes(suicide_rate)) +
+  geom_histogram(fill="deepskyblue2", color="navy") +
+  labs(y="Count", x="Suicide rate per 100k") +
+  ggtitle("Distribution of Suicide Rates per 100K")
+```
+
+### Exploring Suicide rate Variability by Country
+Suicide rate varies from one country to another. This is confirmed by the following bar chart. For easier interpretation, the figure shows the top 25 countries in terms of suicide rates. Lithuania is universally the top country in terms of suicide at a little over 40 suicides per 100k population. This rate is extremely high especially that Lithuania is not a big country like Russia, for example, which comes second after Lituania in the ranking. In fact, the average population size in Lithuania between 1985 and 2016 is `r suicide %>% filter(country=="Lithuania") %>% summarize(rate=mean(suicide_rate)) %>% round(.$rate)` compared to `r suicide %>% filter(country=="Russian Federation") %>% summarize(rate=mean(suicide_rate)) %>% round(.$rate)`. This disproportion in the case of Lithuania induces further exploration of the country populatio size.
+
+```{r rates_by_country, echo=FALSE, fig.align="center", fig.width=5}
+suicide %>% 
+  group_by(country) %>%
+  summarize(country_suicide_rate=sum(suicides_no)*100000/sum(population)) %>%
+  top_n(25) %>%
+  ggplot(aes(reorder(country, country_suicide_rate), country_suicide_rate)) +
+  geom_bar(stat="identity", fill="deepskyblue2", color="navy") +
+  coord_flip() +
+  labs(x="Country", y="Suicide rate per 100k population") +
+  ggtitle("Suicide Rates by Country")
+```
+### Suicide Rate Variability by Population Size
+There seems to be some sort of positive linear association between the country population size and its corresponding suicide rate. Lithuania and the United States can be considered as two outliers in 2 opposite directions in the data. Presence of such extreme values affects the prediction process.
+
+```{r rates_vs_pop, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+suicide %>% group_by(country, year) %>%
+  summarize(pop=mean(population), suicide_rate=sum(suicides_no)*100000/sum(population), pop=sum(pop)) %>% 
+  ungroup() %>%
+  group_by(country) %>%
+  summarize(pop=sum(pop), 
+            suicide_rate=mean(suicide_rate)) %>%
+  ggplot(aes(suicide_rate, pop)) +
+  geom_point(fill="deepskyblue2", color="navy") +
+  geom_text(data = . %>% filter(suicide_rate > 35 | pop > 400000000), 
+            aes(label = country, col=country), 
+            position="dodge") +
+  stat_smooth(method = "lm", color = "red", size = 1) +
+  theme(legend.position = "none") +
+  labs(x="Suicide rate", y="Population") +
+  ggtitle("Suicide Rate Variability by Population Size")
+```
+
+It seems that not all years included in the dataset have the same number of observations. The following plot shows that the year 2016 has the least number of observations. For this reason, year 2016 will be excluded later in the analysis
+```{r n_observations, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+suicide %>% group_by(year) %>%
+  mutate(n=n()) %>%
+  ggplot(aes(year,n)) +
+  geom_point(fill="deepskyblue2", color="navy") +
+  # geom_text(aes(label=country))
+  scale_x_continuous(breaks = seq(1986, 2016, 2)) +
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(y="Observations", x="Year") +
+  ggtitle("Number of Observations per Year")
+```
+
+Suicide rates vary from one year to another. The following timeplot shows that before 1995, there was a global ascending trend of suicide. The opposite is true after 1995, as we see suicide rates decrease in a downward trend.
+```{r rates_timeplot, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+suicide %>% group_by(year) %>%
+  summarize(suicide_rate=sum(suicides_no)*100000/sum(population)) %>%
+  ggplot(aes(year, suicide_rate)) +
+  geom_line(col = "deepskyblue2") +
+  geom_point(col = "deepskyblue2", size = 2) +
+  scale_x_continuous(breaks = seq(1985, 2016, 2)) +
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(x="Year", y="Suicide rate per 100k population") +
+  ggtitle("Suicide Rates Time Plot")
+```
+
+## Effect of Nation Wealth on Suicide Rates
+The next plot shows suicide rates plotted against per capita GDP of the countries in the dataset. It seems that there is a positive linear correlation between suicide rates per 100k population and the country's GDP per capita. There exists some outlier values in the case of Lithuania, where we have relatively small per capita GDP and very high suicide rate (the highest as seen earlier).
+
+```{r rates_gdp, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+suicide %>% group_by(country) %>%
+  summarize(suicide_rate=sum(suicides_no)*100000/sum(population), 
+            gdp_per_capita=mean(gdp_per_capita),
+            pop=sum(as.numeric(population))) %>% 
+  arrange(desc(gdp_per_capita)) %>%
+  ggplot(aes(gdp_per_capita, suicide_rate)) +
+  geom_point(fill="deepskyblue2", color="navy") +
+  stat_smooth(method = "lm", color = "red", size = 1) +
+  geom_text(data = . %>% filter(gdp_per_capita>64000 | 
+            suicide_rate>40), aes(gdp_per_capita, 
+            suicide_rate, label=country, col=country)) +
+  labs(x="Average GDP per capita", y="Suicide rate per 100k population") +
+  ggtitle("GDP per Capita vs. Suicide Rate") +
+  theme(legend.position = "none") 
+```
+
+## Population Characteristics Variability
+Now after taking an overview on suicide variability by several country and nation level variables, we move to demographic variables that characterise the populations of these countries. First, we look at suicide variability by age goup. The following plot shows that suicide rates distribution varies from one age group to another. The highest suicide rates are found in individuals aged 75+ and the lowest suicide rates are found in individuals aged between 5-14. 
+```{r age_boxplot, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+level_key_age <- c(`1` ="5-14 years", `2` = "15-24 years", `3` = "25-34 years", `4` = "35-54 years", `5` = "55-74 years", `6` = "75+ years")
+suicide$age <- recode_factor(as.character(suicide$age), !!!level_key_age)
+
+suicide %>% group_by(age, country) %>%
+  summarize(suicide_rate=sum(suicides_no)*100000/sum(population)) %>%
+  ggplot(aes(age, suicide_rate)) +
+  geom_boxplot(fill="deepskyblue2", col="navy") +
+  labs(x="Age group", y="Suicide rate") +
+  ggtitle("Suicide Rate by Age Group") +
+  theme(axis.text.x = element_text(angle = 30)) 
+```
+
+When looking at suicide rates by sex, the data shows that suicide is more prevalent among males than females, with universal suicide rate of almost 21 versus about 6 suicides per 100k male population.
+
+```{r sex_histogram, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+suicide %>% group_by(sex) %>%
+  summarize(suicide_rate=sum(suicides_no)*100000/sum(population)) %>%
+  ggplot(aes(reorder(sex, suicide_rate), suicide_rate, fill=sex)) +
+  geom_histogram(stat="identity", color="navy") +
+  ggtitle("Suicide Prevalence by Sex") +
+  scale_color_manual(values = c("deepskyblue2", "navy"),
+        aesthetics = c("colour", "fill")) +
+  labs(x="Sex", y="Suicide rate per 100k population", fill="Sex") 
+```
+Suicide rate trends across time varies by sex as well. The following plot shows that the suicide rates for females exhibit a universal descending trend across time while the trend for males fluctuates around 1995 which, resembles the  trend we saw before.
+```{r suicide_trend_bysex, echo=FALSE, fig.align="center", fig.height=3, fig.width=5}
+suicide %>% group_by(year, sex) %>%
+  summarize(suicide_rate=sum(suicides_no)*100000/sum(population)) %>%
+  ggplot(aes(year, suicide_rate, col=sex)) +
+  geom_line() +
+  geom_point() +
+  facet_grid(sex ~ ., scales = "free_y") +
+  scale_x_continuous(breaks = seq(1985, 2016, 2)) +
+  ggtitle("Suicide Rate Trends by Sex") +
+  labs(x="Year", y="Suicide rate per 100k population", col="Sex") +
+  scale_color_manual(values = c("deepskyblue2", "navy"),
+                     aesthetics = c("colour", "fill")) +
+  theme(axis.text.x = element_text(angle = 90), legend.position = "none") 
+```
+
+## 3. Method and Analysis
+From the exploratory analysis performed above, two main observations emerge:
+
+- Lithuania was found to have an extreme value for suicide rates per 100k population. 
+
+- The year 2016 included the least numnber of observations.
+
+- The target variable, `suicide_rate`, is severly positively skewed
+
+Due to these factors, predicting suicide rates can be highly jeopardized if the data is used as is. Several model attempts are made and performance of each attempt is measured.
+
+### Specifying the Model
+Since the target variable, `suicide_rate` is a continuous variable, multiple linear regression algorithm is considered. A regression model is fitted that takes into account country, population size, per capita CGP, year, sex and age group effects on suicide rates per 100k population. The following model is consideres:
+
+$suicide\_rate_{c,p,g,y,s,a} = \mu + \beta_c + \beta_p + \beta_g + \beta_y + \beta_s + \beta_a + \epsilon_{c,p,g,y,s,a}$
+
+where $\beta_c$ is the country effect, $\beta_p$ is the population effect, $\beta_g$ is the per capita GDP effect, $\beta_y$ is the year effect, $\beta_s$ is the sex effect, $\beta_a$ is the age group effect and $\epsilon$ is the model error term.
+
+### Prepping the Data for the Model
+Since the target variable is far from normality, a transformation is considered in order to scale the distribution to symmetry. Many transformations are discussed in the Staitstical literature for the purpose of transforming a skewed variable to a symmetric one, however, not all of them are suitable for the `suicide_rate` variable. The natural $log$ transformation produces infinte values since `suicide_rates` include zero values. For this reason, the value 1 is added to the variable prior to appling the natural $log$ transformation.
+
+```{r data_prep, echo=TRUE}
+# Variable transformation
+suicide_log <- suicide %>%
+  mutate(suicide_rate_log=log(1+suicide_rate))
+```
+
+### Create Training and Testing sets
+Training and testing datasets are created. Testing set is 20% of the entire dataset.
+
+```{r data_split, echo=TRUE}
+# Split to training and testing datasets
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = suicide_log$suicide_rate_log, times = 1, 
+            p = 0.2, list = FALSE)
+train_log <- suicide_log[-test_index,]
+test_log <- suicide_log[test_index,]
+```
+
+### Train the Model
+A linear regression model is fitted using the train data using the `lm` function.
+```{r train_model, echo=TRUE}
+# Train the model
+fit <- train_log %>% 
+  lm(suicide_rate_log ~ population + country + as.factor(year) + sex + age + gdp_per_capita, 
+     data=.)
+```
+
+### Test the Model
+After this, the model is applied to the test data. This is done through the `predict` function. To test the performance of the model, the Root Mean Squared Errors (RMSE) is considered. After generating the model predictions, the RMSE is calculated by comparing the model predictions against the true value of the suicide rates.
+
+```{r test_model, include=FALSE}
+# Generate predictions using the test data
+predictions <- predict(fit, newdata = test_log)
+
+# Calculate RMSE
+rmse <- RMSE(predictions, test_log$suicide_rate_log)
+rmse 
+```
+The value of RMSE is `r rmse`.
+
+2 other models are attempted with the following changes in each attempt:
+
+- Eliminate the year 2016
+
+- Eliminate Lithuania
+
+Training and testing data sets are generated again to accommodate the above changes for each case and the models are refitted. Comparison between models perfomance is done through RMSE values.
+
+```{r model_2_3_attempts, include=FALSE}
+############  Model Attempt2 ############
+######### Eliminating year 2016 ######### 
+suicide_trim_log <- suicide_log %>% 
+  filter(year!=2016)
+
+# Split to training and testing datasets
+set.seed(1, sample.kind="Rounding")
+test_index_trim <- createDataPartition(y = suicide_trim_log$suicide_rate_log, times = 1, p = 0.2, list = FALSE)
+train_trim_log <- suicide_log[-test_index_trim,]
+test_trim_log <- suicide_log[test_index_trim,]
+
+# Train the model
+fit_trim <- train_trim_log %>% 
+  lm(suicide_rate_log ~ population + country + as.factor(year) + sex + age + gdp_per_capita, 
+     data=.)
+
+# Generate predictions using the test data
+predictions_trim <- predict(fit_trim, newdata = test_trim_log)
+
+# Calculate RMSE
+rmse_trim <- RMSE(predictions_trim, test_trim_log$suicide_rate_log)
+rmse_trim
+
+############  Model Attempt3 ############
+######### Eliminating year 2016 ######### 
+############# and Lithuania ############# 
+suicide_trim2_log <- suicide_trim_log %>% 
+  filter(country!="Lithuania")
+
+# Split to training and testing datasets
+set.seed(1, sample.kind="Rounding")
+test_index_trim2 <- createDataPartition(y = suicide_trim2_log$suicide_rate_log, times = 1, p = 0.2, list = FALSE)
+train_trim2_log <- suicide_trim2_log[-test_index_trim2,]
+test_trim2_log <- suicide_trim2_log[test_index_trim2,]
+
+# Train the model
+fit_trim2 <- train_trim2_log %>% 
+  lm(suicide_rate_log ~ population + country + as.factor(year) + sex + age + gdp_per_capita, 
+     data=.)
+
+# Generate predictions using the test data
+predictions_trim2 <- predict(fit_trim2, newdata = test_trim2_log)
+
+# Calculate RMSE
+rmse_trim2 <- RMSE(predictions_trim2, test_trim2_log$suicide_rate_log)
+rmse_trim2
+```
+
+## 4. Results and Conclusions
+The suicide rates per 100k populations prediction algorithm includes several country-level variables in addition to population demographic characteristics. The model used for prediction is a multiple linear regression model fitted to the training data and tested on the testing data. 3 models are fitted based on 3 different cases. Assessment of the perfomance is based on the value of RMSE 
+
+The following table summarizes the performance of each model:
+```{r compare_models, echo=TRUE}
+rmse_results <- tibble(method = c("Model1: log trans", 
+                "Model2: log trans, 2016 trim",
+                "Model3: log transform, 2016 and Lithuania trim"), 
+                RMSE = c(rmse, rmse_trim, rmse_trim2))
+rmse_results
+```
+Model 2 yielded the least value of RMSE at `r rmse_trim` and is considered the best model for predicting suicide rates per 100k population.
+
+Additional modeling attempts were made. They are based on the concept of regularization; to penalize the least squares estimates using the parameter `lambda` to optimize for `lambda` that minimizes the RMSE. The attempt yielded value of zero for `lambda`: suggesting that no penalty for the least squares estimates of the model would further enhance the model performance. The attempt is not discussed in the report but it is included in the R script file.
+
+There are other variables that exist in the dataset but not included in the analysis and the modeling. These variables are: 
+
+- `gdp_for_year`, which is the GDP of the country at a given year. It is eliminated as it is highly correlated with `gdp_per_capita` to eliminate multicollinearity in the model. `gdp_per_capita` was selected over `gdp_for_year` as it is a better measure for the GDP and wealth of the nations that takes into account population size.
+
+- `generation`, which is a categorical variable for the generation of the population. It is left out as it is highly correlated with `age`. `age` is selected over `generation` to include in the analysis as it more easily and intuitively understood.
+
+- `HDI.for.year`, as over two thirds of the variable is missing.
+
+
+## 5. Limitations and Future Work
+In this project, a transformation for the target variable is introduced which is the log transformation after adding +1 to the variable. This particular transfomration and the value 1 were are selected based on convenience. Other transformations can be explored and optimized for the purpose of predicting suicide rates. 
+
+In one of the model fitting attemps, records for Lithuania are eliminated. This is because Lithuania was identified as an outlier amongst the other countries in the data. This approach may not be the best to handle such case, especially if the suicide rate values reported for Lithuania are accurate. Further work can go into exploring methods to better understand and penalize the leverage that Lithuania imposes on the data
+
+
